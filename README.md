@@ -6,7 +6,12 @@ A skin manager for Hana — import, preview and apply SKINPACK theme packs, or c
 ## 功能 / Features
 
 - **皮肤墙** — 搜索、分组、标签、收藏置顶；每张卡片带真实封面预览
-- **工作台** — 从零做皮肤：背景图（自动压缩）、四色派生配色、五套明暗预设、圆角 / 描边 / 毛玻璃滑杆、字体栈、终端 ANSI 16 色
+- **界面亮/暗** — 面板自身三态切换（跟随宿主 / 亮 / 暗），存在本地，不动宿主设置
+- **暗/亮双套（v3）** — 一张包带两套配色与两张背景；导出后注册成两条主题，用户在设置里各取所需
+- **动图壁纸（v3）** — 背景可放 animated WebP / GIF / APNG，`background-image` 直接播（零脚本注入）；带 poster 与 `prefers-reduced-motion` 降级
+- **动图壁纸管线** — `node scripts/wallpaper/make-wallpaper-pack.mjs --video <文件> --pack-id <id> --name-zh <名> --credit <出处> --enqueue`：裁顶去水印 → 抽帧 → 溶解循环 → WebP → 组包入库存（依赖 ffmpeg + Python/Pillow）
+- **主题 Tokens 导出（v1）** — `GET /api/apps/skin-wardrobe/routes/tokens[?packId=]`：只读、带版本的主题描述 JSON（skinId / 浅深 / 颜色 / 字体 / 圆角 / 背景与材质元数据），供其他插件消费；`source: "pack-config"` 标注为原始配置值
+- **工作台** — 从零做皮肤：背景图（自动压缩）、四色派生配色、五套明暗预设、双套联动派生（同色相 / 互补 / 反相）、圆角 / 描边 / 毛玻璃滑杆、字体栈、终端 ANSI 16 色
 - **内置主题** — 安装即预装成品主题，开箱可用
 - **启停链路** — App 管库存与待办；「执行待办」由随包内置的执行器落宿主注册表（需 `app/process.spawn`），重启 Hana 生效
 

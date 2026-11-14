@@ -53,7 +53,7 @@ html, body {
 .bar-right { display: flex; align-items: center; gap: var(--sp-2); }
 
 .search {
-  width: 190px; padding: 7px 12px;
+  width: 190px; max-width: 260px; min-width: 96px; flex: 1 1 auto; padding: 7px 12px;
   border-radius: 8px;
   border: 1px solid color-mix(in srgb, var(--text, #EDEDED) 16%, transparent);
   background: color-mix(in srgb, var(--text, #EDEDED) 4%, transparent);
@@ -68,6 +68,8 @@ html, body {
   border: 1px solid color-mix(in srgb, var(--text, #EDEDED) 18%, transparent);
   background: transparent; color: var(--text, #EDEDED);
   transition: border-color .15s, background .15s;
+  /* 顶栏挤的时候不许被压成竖排（加界面主题按钮后实测会） */
+  white-space: nowrap; flex: 0 0 auto;
 }
 .btn:hover { border-color: color-mix(in srgb, var(--text, #EDEDED) 40%, transparent); }
 .btn-primary {
@@ -342,3 +344,89 @@ body.is-dragover .wall-wrap {
 .c-status { font-size: 11px; color: color-mix(in srgb, var(--text, #EDEDED) 50%, transparent); flex: 1; min-width: 0; }
 .composer-actions { display: flex; gap: var(--sp-2); }
 .composer-actions .btn { padding: 8px 20px; }
+
+/* ── v3 双套 / 动图 ── */
+.dual-block {
+  display: flex; align-items: center; gap: var(--sp-4); flex-wrap: wrap;
+  padding: var(--sp-3) var(--sp-4);
+  margin-bottom: var(--sp-4);
+  border: 1px solid color-mix(in srgb, var(--text, #EDEDED) 12%, transparent);
+  border-radius: 10px;
+  background: color-mix(in srgb, var(--text, #EDEDED) 3%, transparent);
+}
+.dual-block .switch { display: flex; align-items: center; gap: 6px; font-size: 12px; cursor: pointer; }
+.dual-block .switch input { accent-color: var(--accent, #8A8A96); width: 15px; height: 15px; }
+.link-row { display: flex; align-items: center; gap: var(--sp-3); }
+.link-row select {
+  padding: 5px 9px; border-radius: 8px; font-size: 12px;
+  border: 1px solid color-mix(in srgb, var(--text, #EDEDED) 16%, transparent);
+  background: var(--bg, #141313); color: var(--text, #EDEDED);
+}
+.light-only { margin-bottom: var(--sp-4); }
+.sub-h {
+  margin: var(--sp-3) 0 var(--sp-2); font-size: 12px; font-weight: 600;
+  color: color-mix(in srgb, var(--text, #EDEDED) 70%, transparent);
+  letter-spacing: .02em;
+}
+/* 动图预览：<img> 填满预览框并居中，在浏览器里真会动（验收 7） */
+.bg-preview img.anim-img {
+  width: 100%; height: 100%; object-fit: cover; display: block;
+}
+
+/* ════════════════════════════════════════════
+   界面主题：卡片自身的亮 / 暗（与皮肤包无关）
+   - 默认（无 data-ui）= 跟随宿主主题，沿用宿主变量（现状行为）
+   - 属性挂在 <body> 而不是 <html>：面板可能与宿主同文档，
+     挂 html 会把整个 Hana 窗口一起染色（本项目自己的约束：“不写 :root”）。
+   - body 自己声明变量 → body 的 background（var(--bg)）也跟着变，不用碰根元素
+   - accent 与 bg 必须明暗相反：部分按钮文字用 var(--bg) 做反色
+   ════════════════════════════════════════════ */
+body[data-ui="light"] {
+  --bg: #F7F6F3;
+  --bg-card: #FFFFFF;
+  --bg-glass: #FFFFFFF2;
+  --sidebar-bg: #F1EFEA;
+  --text: #1C1B19;
+  --text-light: #57534C;
+  --text-muted: #6E6A62;
+  --border: #1C1B1924;
+  --accent: #8C6335;
+  --accent-hover: #74522B;
+  --copper: #8C6335;
+  --copper-l: #B99B6E;
+  color-scheme: light;
+}
+body[data-ui="dark"] {
+  --bg: #141313;
+  --bg-card: #1B1A19;
+  --bg-glass: #1B1A19F2;
+  --sidebar-bg: #191818;
+  --text: #EDEDED;
+  --text-light: #C9C7C4;
+  --text-muted: #9A9793;
+  --border: #EDEDED24;
+  --accent: #B08155;
+  --accent-hover: #C79A6D;
+  --copper: #9C6B3F;
+  --copper-l: #C4A683;
+  color-scheme: dark;
+}
+
+/* 界面主题按钮：三个图标互斥显示，不靠 JS 换 DOM */
+.icon-btn {
+  width: 30px; height: 30px; flex-shrink: 0;
+  display: inline-flex; align-items: center; justify-content: center;
+  padding: 0; border-radius: 8px; cursor: pointer;
+  border: 1px solid color-mix(in srgb, var(--text, #EDEDED) 16%, transparent);
+  background: transparent;
+  color: color-mix(in srgb, var(--text, #EDEDED) 62%, transparent);
+  transition: color .15s, border-color .15s;
+}
+.icon-btn:hover {
+  color: var(--text, #EDEDED);
+  border-color: color-mix(in srgb, var(--text, #EDEDED) 40%, transparent);
+}
+.icon-btn svg { width: 16px; height: 16px; display: none; }
+body:not([data-ui]) .icon-btn .ic-auto { display: block; }
+body[data-ui="light"] .icon-btn .ic-sun { display: block; }
+body[data-ui="dark"] .icon-btn .ic-moon { display: block; }

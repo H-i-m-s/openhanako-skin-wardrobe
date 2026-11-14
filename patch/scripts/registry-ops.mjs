@@ -180,5 +180,48 @@ if (action === 'add') {
   process.exit(0);
 }
 
+/* ⚠️ auto 指针手术：本版（v3）**不投入生产**，仅保留作 v3.1 的地基。
+   两个硬事实（见 docs/SPEC-skinpack-v3.md §3.4）：
+     ① server bundle 里是 `autoLightDefault: zYr`（变量间接引用），下面的引号正则**命中不了**；
+     ② 只改 renderer 一处、server 不改，会造成「一半生效」的静默错。
+   所以这里改成 **all-or-nothing**：任何一处目标里出现了 autoLightDefault 但正则改不动，
+   全单中止，一行都不写。宁可报错，不要半套。 */
+if (action === 'auto') {
+  const light = getArg('light');
+  const dark = getArg('dark');
+  if (!light || !dark) { console.error('缺少 --light / --dark'); process.exit(2); }
+
+  const plan = [];
+  for (const t of targets) {
+    const text = readFileSync(t.path, 'utf8');
+    const hasConst = /autoLightDefault|autoDarkDefault/.test(text);
+    const reLight = /(autoLightDefault\s*[:=]\s*)(['"])(.*?)\2/g;
+    const reDark = /(autoDarkDefault\s*[:=]\s*)(['"])(.*?)\2/g;
+    let after = text;
+    const applyOne = (re, newVal) => after.replace(re, (m, pre, q, val) =>
+      val === newVal ? m : pre + q + newVal + q);
+    after = applyOne(reLight, light);
+    after = applyOne(reDark, dark);
+    if (after === text && hasConst) {
+      console.error(`${t.label}: 含有 auto 常量但形态不是引号字面量（变量间接引用），本工具不支持。\n` +
+        `  → 拒绝写入，全部目标一行不改。需要改这种形态请先给 registry-ops 加专用子命令。`);
+      process.exit(3);
+    }
+    plan.push({ t, before: text, after });
+  }
+
+  for (const { t, before, after } of plan) {
+    if (after === before) {
+      console.log(`${t.label}: auto 常量未变化（无 autoLightDefault/autoDarkDefault 或已是目标值）`);
+      continue;
+    }
+    const gate = syntaxOk(after);
+    if (!gate.ok) { console.log(`${t.label}: auto 修改后语法不合格，拒绝写入\n${gate.err}`); continue; }
+    console.log(`${t.label}: auto 指针 → light=${light}, dark=${dark}${APPLY ? ' 已写入' : ' [干跑]'}`);
+    if (APPLY) writeFileSync(t.path, after, 'utf8');
+  }
+  process.exit(0);
+}
+
 console.error('未知动作：' + action);
 process.exit(2);

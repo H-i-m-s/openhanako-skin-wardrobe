@@ -62,25 +62,53 @@ function writePending(list) {
 }
 
 /* ── 工具 ── */
-const hexToRgb = (hex) => {
-  const m = /^#([0-9a-f]{6})$/i.exec((hex || '').trim());
-  if (!m) return null;
-  return [0, 2, 4].map((i) => parseInt(m[1].slice(i, i + 2), 16));
-};
+/** 归一化任意 CSS 颜色为 RGB 三元；解析不了返回 null（调用方必须报错，不许静默回退） */
+function parseRgbTriple(input) {
+  const s = typeof input === 'string' ? input.trim() : '';
+  if (!s) return null;
+  let m = /^#([0-9a-f]{3})$/i.exec(s);
+  if (m) return m[1].split('').map((c) => parseInt(c + c, 16));
+  m = /^#([0-9a-f]{6})(?:[0-9a-f]{2})?$/i.exec(s);
+  if (m) return [0, 2, 4].map((i) => parseInt(m[1].slice(i, i + 2), 16));
+  m = /^rgba?\(\s*([\d.]+)\s*[,\s]\s*([\d.]+)\s*[,\s]\s*([\d.]+)/i.exec(s);
+  if (m) {
+    const out = [m[1], m[2], m[3]].map((v) => Math.round(Number(v)));
+    return out.every((n) => Number.isFinite(n) && n >= 0 && n <= 255) ? out : null;
+  }
+  return null;
+}
+const rgbToHex6 = (rgb) => '#' + rgb.map((v) => Math.max(0, Math.min(255, v)).toString(16).padStart(2, '0')).join('');
+/** 注册表要求 6 位不透明 hex：从配色取 --bg 归一化后再转 */
+function bgHexOf(colors) {
+  const rgb = parseRgbTriple((colors || {})['--bg']);
+  return rgb ? rgbToHex6(rgb) : '#141313';
+}
+/** 老名字保留（若别处还在用） */
+const hexToRgb = (hex) => parseRgbTriple(hex);
 
 /** 生成该皮肤的 CSS：配色块 + 背景块（用 Luna 的背景结构做模板） */
-function buildCss(pack) {
-  const theme = pack.theme || {};
-  const colors = theme.colors || {};
-  const id = 'hana-' + pack.packId;
+function buildCss(pack, variant, appearance, suffix) {
+  const colors = variant.colors || {};
+  const id = 'hana-' + pack.packId + (suffix || '');
   const rawBg = colors['--bg'];
-  const bgHex = (typeof rawBg === 'string' && /^#[0-9a-fA-F]{6}$/.test(rawBg)) ? rawBg : '#141313';
-  const rgb = hexToRgb(bgHex) || [20, 19, 19];
+  let rgb;
+  if (rawBg === undefined || rawBg === null || rawBg === '') {
+    // 缺 --bg：沿用旧行为（Luna 底），但明确告警，不假装正常
+    rgb = [20, 19, 19];
+    console.warn(`[warn] ${id}: 缺少 --bg，回落到 #141313`);
+  } else {
+    rgb = parseRgbTriple(rawBg);
+    if (!rgb) {
+      throw new Error(`--bg 无法解析：${JSON.stringify(rawBg)}（支持 #RGB / #RRGGBB / #RRGGBBAA / rgb() / rgba()）`);
+    }
+  }
+  const bgHex = rgbToHex6(rgb);
 
   const rawName = (pack.names && (pack.names.zh || pack.names.en)) || pack.packId;
   const commentName = String(rawName).replace(/\*\//g, '* /').replace(/[\r\n]+/g, ' ').slice(0, 120);
   const lines = [];
-  lines.push(`/* 衣橱导出 · ${commentName} · ${new Date().toISOString().slice(0, 10)} */`);
+  const commentSuffix = suffix ? ` · ${appearance}` : '';
+  lines.push(`/* 衣橱导出 · ${commentName}${commentSuffix} · ${new Date().toISOString().slice(0, 10)} */`);
 
   /* 1. 配色块 */
   lines.push(`[data-theme="${id}"] {`);
@@ -94,7 +122,8 @@ function buildCss(pack) {
   lines.push('}');
 
   /* 2. 背景块：拿 Luna 的背景结构当模板，换图换色换主题 id */
-  const bgAsset = theme.background && theme.background.asset;
+  const bg = variant.background || {};
+  const bgAsset = bg.asset;
   const safeBgAsset = (typeof bgAsset === 'string' && /^data:image\/[a-zA-Z0-9.+-]+;base64,[A-Za-z0-9+/=]+$/.test(bgAsset)) ? bgAsset : null;
   if (safeBgAsset) {
     let tpl = TEMPLATE_BG ? readFileSync(TEMPLATE_BG, 'utf8') : '';
@@ -110,13 +139,19 @@ function buildCss(pack) {
       // 图片占位符
       tpl = tpl.replaceAll('__BG_DARK_DATA_URI__', safeBgAsset);
 
-      // 底色：把模板里的 Luna 底色换成本皮肤底色
-      tpl = tpl.replaceAll('20, 19, 19', rgb.join(', '));
+      // ⚠️⚠️ 背景层必须编译成字面量（2026-11-12 本地二分定案，不要回退成 var()）：
+      //   含 var() 的声明在 Blink 里走「待替换」路径，与超大 url() 同条声明时会撞上
+      //   ~2MB 的替换值上限（与 panel-frame/bg.js 注释 ② 的自定义属性值上限同族），
+      //   超限 → 整条 background-image 被静默丢弃 → 黑屏。
+      //   实验矩阵：var+80KB url 活、var+2.8MB url 黑、var+6.3MB url 黑、
+      //   literal+2.8MB url 活、Luna literal+3.9MB 一直活。
+      //   Luna 手工管线（apply.ps1）从来都是字面量，这就是它没黑过的原因。
+      tpl = tpl.replaceAll('var(--bg-rgb)', rgb.join(', '));
       tpl = tpl.replaceAll('#141313', bgHex);
 
-      // 透明度参数
-      const pa = theme.background.panelAlpha;
-      const ca = theme.background.cardAlpha;
+      // 透明度参数（模板已编译为字面量，按字面量覆盖；顺序必须在上面编译之后）
+      const pa = bg.panelAlpha;
+      const ca = bg.cardAlpha;
       if (typeof pa === 'number' && Number.isFinite(pa) && pa >= 0 && pa <= 1) {
         tpl = tpl.replaceAll(`rgba(${rgb.join(', ')}, 0.55)`, `rgba(${rgb.join(', ')}, ${pa})`);
       }
@@ -127,6 +162,22 @@ function buildCss(pack) {
       lines.push('');
       lines.push(`/* ── 背景层 ── */`);
       lines.push(tpl.trim());
+
+      /* 2b. 动图降级：prefers-reduced-motion 下用 poster 替代动图（spec §2.1）。
+       * 只换照片位（url），scrim 层序不变、不新增不删除层。 */
+      const motion = bg.motion || {};
+      const poster = bg.poster;
+      const safePoster = (typeof poster === 'string' && /^data:image\/[a-zA-Z0-9.+-]+;base64,[A-Za-z0-9+/=]+$/.test(poster)) ? poster : null;
+      if (motion.mode === 'animated-image' && safePoster) {
+        const m = tpl.match(/background-image:\s*([^;]*url\([^)]*\)[^;]*);/);
+        if (m) {
+          const posterValue = m[1].replace(`url("${safeBgAsset}")`, `url("${safePoster}")`);
+          lines.push('');
+          lines.push('@media (prefers-reduced-motion: reduce) {');
+          lines.push(`  :is([data-theme="${id}"]) [data-chalkboard-root] { background-image: ${posterValue}; }`);
+          lines.push('}');
+        }
+      }
     }
   }
 
@@ -143,7 +194,7 @@ function buildCss(pack) {
   }
 
   /* 4. 材质参数覆盖：包里的值优先于通用材质默认值 */
-  const mi = theme.material || {};
+  const mi = variant.material || {};
   const overrides = [];
   if (typeof mi.rim === 'number' && Number.isFinite(mi.rim)) overrides.push(`--mat-rim: ${mi.rim};`);
   if (typeof mi.blur === 'number' && Number.isFinite(mi.blur)) overrides.push(`--mat-blur: ${Math.round(mi.blur)}px;`);
@@ -161,7 +212,7 @@ function buildCss(pack) {
   lines.push('');
   lines.push(`/* ── 兜底 ── */`);
   lines.push(`[data-theme="${id}"] {`);
-  lines.push(`  color-scheme: ${theme.appearance === 'light' ? 'light' : 'dark'};`);
+  lines.push(`  color-scheme: ${appearance === 'light' ? 'light' : 'dark'};`);
   lines.push('}');
 
   return lines.join('\n') + '\n';
@@ -246,30 +297,77 @@ for (const item of open) {
         if (APPLY) { item.done = true; item.doneAt = new Date().toISOString(); item.result = 'skipped: unsafe packId'; }
         continue;
       }
-      const themeId = 'hana-' + pack.packId;
-      const cssOut = join(THEMES_DIR, themeId + '.css');
+      const theme = pack.theme || {};
+      const variants = Array.isArray(theme.variants) ? theme.variants : null;
+      const darkV = variants && variants.find((v) => v && v.appearance === 'dark');
+      const lightV = variants && variants.find((v) => v && v.appearance === 'light');
+      const isDual = !!(darkV && lightV);
+      const displayName = (pack.names && (pack.names.zh || pack.names.en)) || pack.packId;
 
-      const css = buildCss(pack);
-      console.log(`   生成 CSS ${themeId}.css（${(css.length / 1024).toFixed(0)} KB）`);
-      console.log(`   注册表插入 ${themeId}`);
+      if (!isDual) {
+        // 老包 / 单套：完全走 v2 老路（spec §1），逐字节兼容、不产生带后缀 id
+        const appearance = theme.appearance === 'light' ? 'light' : 'dark';
+        const themeId = 'hana-' + pack.packId;
+        const cssOut = join(THEMES_DIR, themeId + '.css');
+        const css = buildCss(pack, { colors: theme.colors, background: theme.background, material: theme.material }, appearance, '');
+        console.log(`   生成 CSS ${themeId}.css（${(css.length / 1024).toFixed(0)} KB）`);
+        console.log(`   注册表插入 ${themeId}`);
+        if (APPLY) {
+          writeFileSync(cssOut, css, 'utf8');
+          const spec = JSON.stringify({
+            cssPath: `themes/${themeId}.css`,
+            backgroundColor: bgHexOf(theme.colors),
+            appearance,
+            i18nName: displayName,
+            i18nMode: displayName + ' · 模式',
+          });
+          const r = registryOps(['add', '--id', themeId, '--spec', spec, '--apply']);
+          console.log('   ' + r.trim().split('\n').join('\n   '));
+          item.done = true;
+          item.doneAt = new Date().toISOString();
+          item.result = 'enabled ' + themeId;
+        }
+      } else {
+        // 双套：暗 + 亮，各一份 CSS 与一条注册表条目（spec §1 / §3.1）
+        const order = [
+          { v: darkV, ap: 'dark' },
+          { v: lightV, ap: 'light' },
+        ];
+        for (const { v, ap } of order) {
+          const themeId = 'hana-' + pack.packId + '-' + ap;
+          const cssOut = join(THEMES_DIR, themeId + '.css');
+          const css = buildCss(pack, v, ap, '-' + ap);
+          console.log(`   生成 CSS ${themeId}.css（${(css.length / 1024).toFixed(0)} KB）`);
+          console.log(`   注册表插入 ${themeId}`);
+          if (APPLY) {
+            writeFileSync(cssOut, css, 'utf8');
+            const bgHex6 = bgHexOf(v.colors);
+            const spec = JSON.stringify({
+              cssPath: `themes/${themeId}.css`,
+              backgroundColor: bgHex6,
+              appearance: ap,
+              i18nName: displayName + ' · ' + (ap === 'dark' ? '暗色' : '亮色'),
+              i18nMode: displayName + ' · ' + (ap === 'dark' ? '暗色' : '亮色') + ' · 模式',
+            });
+            const r = registryOps(['add', '--id', themeId, '--spec', spec, '--apply']);
+            console.log('   ' + r.trim().split('\n').join('\n   '));
+          }
+        }
 
-      if (APPLY) {
-        writeFileSync(cssOut, css, 'utf8');
-        // i18n 用包里的名字：宿主找不到 key 时会直接显示原文，
-        // 自用场景下「Luna 龙娘 · 玫瑰月影」比一串 key 好得多。
-        const displayName = (pack.names && (pack.names.zh || pack.names.en)) || pack.packId;
-        const spec = JSON.stringify({
-          cssPath: `themes/${themeId}.css`,
-          backgroundColor: (pack.theme.colors || {})['--bg'] || '#141313',
-          appearance: pack.theme.appearance || 'dark',
-          i18nName: displayName,
-          i18nMode: displayName + ' · 模式',
-        });
-        const r = registryOps(['add', '--id', themeId, '--spec', spec, '--apply']);
-        console.log('   ' + r.trim().split('\n').join('\n   '));
-        item.done = true;
-        item.doneAt = new Date().toISOString();
-        item.result = 'enabled ' + themeId;
+        // 自适应策略（spec §3.4）：本版只做 manual。
+        // auto 指针已关闭 —— 宿主 server bundle 里是 `autoLightDefault: zYr`（变量间接引用），
+        // 朴素字符串替换只能改到 renderer 那一处，会造成「一半生效」的静默错。
+        const adaptive = theme.adaptive || {};
+        if (adaptive.mode === 'auto') {
+          console.log('   自适应：adaptive.mode=auto 本版不支持，按 manual 处理（只注册两条，不动宿主 auto 指针）');
+        } else {
+          console.log('   自适应 manual：仅注册两条，不动宿主 auto 指针');
+        }
+        if (APPLY) {
+          item.done = true;
+          item.doneAt = new Date().toISOString();
+          item.result = 'enabled dual ' + pack.packId;
+        }
       }
     } else if (item.op === 'disable') {
       const themeId = item.themeId || ('hana-' + item.packId);
@@ -278,15 +376,24 @@ for (const item of open) {
         if (APPLY) { item.done = true; item.doneAt = new Date().toISOString(); item.result = 'skipped: unsafe themeId'; }
         continue;
       }
-      const cssOut = join(THEMES_DIR, themeId + '.css');
-      console.log(`   注册表移除 ${themeId}`);
+      // 双套包：enable 写的是 -dark/-light 两条，停用带无后缀 id 会去摘不存在的条目（BUG：双生·极光删不掉的根因）。
+      // 存在性判定：THEMES_DIR 里若有 -dark/-light CSS，就把它们当真实 id 一并摘。
+      const dualIds = [themeId + '-dark', themeId + '-light']
+        .filter((id) => existsSync(join(THEMES_DIR, id + '.css')));
+      const idsToRemove = dualIds.length ? dualIds : [themeId];
+      for (const id of idsToRemove) {
+        const cssOut = join(THEMES_DIR, id + '.css');
+        console.log(`   注册表移除 ${id}`);
+        if (APPLY) {
+          const r = registryOps(['remove', '--id', id, '--apply']);
+          console.log('   ' + r.trim().split('\n').join('\n   '));
+          if (existsSync(cssOut)) { writeFileSync(cssOut + '.disabled', readFileSync(cssOut)); }
+        }
+      }
       if (APPLY) {
-        const r = registryOps(['remove', '--id', themeId, '--apply']);
-        console.log('   ' + r.trim().split('\n').join('\n   '));
-        if (existsSync(cssOut)) { writeFileSync(cssOut + '.disabled', readFileSync(cssOut)); }
         item.done = true;
         item.doneAt = new Date().toISOString();
-        item.result = 'disabled ' + themeId;
+        item.result = 'disabled ' + idsToRemove.join(' + ');
       }
     } else {
       console.log('   未知 op：' + item.op);

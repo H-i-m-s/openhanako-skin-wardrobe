@@ -1,4 +1,10 @@
 import { hana } from './sdk.js';
+import {
+  BASE_COLORS, PRESETS, hex2rgb, toHex, shade, luminance, deriveColors,
+  SCHEMA_V3, IMG_MAX_BYTES, PACK_MAX_BYTES, ANIMATED_EXT, VIDEO_EXT,
+  checkImageFile, checkPackBudget, validateSkinPack,
+  deriveKeyColors, buildVariant, buildBgPreviewDescriptor, fmtMB,
+} from './skinpack.mjs';
 
 /**
  * 衣橱 · 皮肤库 —— 前端
@@ -12,7 +18,7 @@ import { hana } from './sdk.js';
  */
 
 const API = '/api/apps/skin-wardrobe/routes';
-const BUILD = 'lib-14';
+const BUILD = 'lib-23';
 
 /** 纯衣架（品牌符号）：横杆铜色固定，线条取当前文字色 */
 function hangerSVG(size, strokeColor, barColor) {
@@ -39,6 +45,49 @@ const el = {
   execute: document.getElementById('execute'),
 };
 
+/* ── 界面主题（卡片自身，独立于皮肤包）──────────────────────────
+   auto = 不设 data-ui，沿用宿主主题变量（原来的行为）
+   light / dark = 在 <body> 上挂 data-ui，覆盖宿主 token（见 panel.css 尾部）
+   选择存 localStorage，不写宿主设置、不影响皮肤包。 */
+const UI_THEME_KEY = 'wardrobe-ui-theme';
+const UI_MODES = ['auto', 'light', 'dark'];
+const UI_LABEL = { auto: '跟随宿主', light: '亮色', dark: '暗色' };
+const uiThemeBtn = document.getElementById('ui-theme');
+// 沙箱 iframe 里 localStorage 可能直接抛 SecurityError；一旦抛出会拖垮整个面板，所以包一层
+function uiReadStored() {
+  try { return localStorage.getItem(UI_THEME_KEY); } catch { return null; }
+}
+function uiWriteStored(mode) {
+  try { localStorage.setItem(UI_THEME_KEY, mode); } catch { /* 存不了就只在本会话生效 */ }
+}
+let uiMode = uiReadStored() || 'auto';
+if (!UI_MODES.includes(uiMode)) uiMode = 'auto';
+// 调试/截图用：?ui=light / ?ui=dark / ?ui=auto 临时覆盖，不写回 localStorage
+const uiOverride = new URLSearchParams(location.search).get('ui');
+const uiPinned = UI_MODES.includes(uiOverride || '') ? uiOverride : null;
+if (uiPinned) uiMode = uiPinned;
+
+function applyUiMode(mode) {
+  const host = document.body;
+  if (mode === 'auto') host.removeAttribute('data-ui');
+  else host.setAttribute('data-ui', mode);
+  if (!uiPinned) uiWriteStored(mode);
+  if (uiThemeBtn) {
+    const label = '界面主题：' + UI_LABEL[mode];
+    uiThemeBtn.title = label;
+    uiThemeBtn.setAttribute('aria-label', label);
+  }
+  uiMode = mode;
+}
+
+applyUiMode(uiMode);
+if (uiThemeBtn) {
+  uiThemeBtn.addEventListener('click', () => {
+    const next = UI_MODES[(UI_MODES.indexOf(uiMode) + 1) % UI_MODES.length];
+    applyUiMode(next);
+  });
+}
+
 const state = {
   skins: [],
   pending: [],
@@ -55,12 +104,13 @@ const state = {
 async function api(method, path, body) {
   const qs = new URLSearchParams(window.location.search);
   const hasSess = qs.has('appSurfaceSession');
+  const isRaw = body instanceof ArrayBuffer || body instanceof Uint8Array;
   let res;
   try {
     res = await hana.api.fetch(path, {
       method,
-      headers: body ? { 'content-type': 'application/json' } : undefined,
-      body: body ? JSON.stringify(body) : undefined,
+      headers: body ? { 'content-type': isRaw ? 'application/octet-stream' : 'application/json' } : undefined,
+      body: body ? (isRaw ? body : JSON.stringify(body)) : undefined,
     });
   } catch (e) {
     // 诊断：把 surface 凭证的有无直接摊在状态栏上
@@ -71,7 +121,7 @@ async function api(method, path, body) {
     let detail = '';
     try { detail = (await res.text()).slice(0, 90); } catch (_) { /* 无正文 */ }
     setStatus(`HTTP ${res.status} ${detail} · session=${hasSess ? '有' : '无'} · ${method} ${path}`);
-    throw new Error('HTTP ' + res.status);
+    throw new Error('HTTP ' + res.status + (detail ? ' · ' + detail : ''));
   }
   let json = null;
   try { json = await res.json(); } catch (_) { /* 空响应 */ }
@@ -378,25 +428,11 @@ async function removeSkin(s) {
   }
 }
 
-/* ── 导入 ── */
+/* ── 导入 ──
+   校验委托给 skinpack.mjs 的统一校验（v1/v2/v3 都覆盖，含动图体积与单包体积门禁）。 */
 function validatePack(json) {
-  const errs = [];
-  const warns = [];
-  if (!json || typeof json !== 'object') { errs.push('不是 JSON 对象'); return { errs, warns }; }
-  if (!json.packId) errs.push('缺 packId');
-  if (!json.schema) warns.push('缺 schema 字段');
-  else if (!/^hana-skinpack\//.test(json.schema)) errs.push('schema 不认识：' + json.schema);
-
-  // v2 是 theme 单对象，v1 是 themes 数组
-  if (json.theme) {
-    if (!json.theme.colors || typeof json.theme.colors !== 'object') errs.push('theme.colors 缺失');
-  } else if (Array.isArray(json.themes)) {
-    if (!json.themes.length) errs.push('themes 为空');
-    else warns.push('这是 v1 包（配色层），导入后只保留配色');
-  } else {
-    errs.push('既没有 theme 也没有 themes');
-  }
-  return { errs, warns };
+  const r = validateSkinPack(json);
+  return { errs: r.errors, warns: r.warnings };
 }
 
 async function importFile(file) {
@@ -497,141 +533,8 @@ try {
    一张背景图，派生的二十来项按规则自动跟随。
    ══════════════════════════════════════════ */
 
-const BASE_COLORS = {
-  '--bg': '#141313',
-  '--bg-card': '#1E1D1E',
-  '--bg-glass': '#1E1D1EEB',
-  '--sidebar-bg': '#191719',
-  '--accent': '#CD5B85',
-  '--accent-hover': '#DA84A4',
-  '--accent-light': '#CD5B8526',
-  '--link': '#E4A3C3',
-  '--link-hover': '#F0C1D7',
-  '--text': '#F0EFF0',
-  '--text-light': '#D0CAD1',
-  '--text-muted': '#AAA2AD',
-  '--hana-text': '#F0EFF0',
-  '--border': '#B896C138',
-  '--shadow': '#00000070',
-  '--green': '#9DCCAC',
-  '--coral': '#DFB0A1',
-  '--danger': '#F09AAB',
-  '--jian-note-bg': '#262127',
-  '--jian-note-border': '#B896C140',
-  '--mood-bg': '#B896C112',
-  '--mood-text': '#C8ACD1',
-  '--mood-border': '#B896C133',
-  '--tool-bg': '#B896C10D',
-  '--tool-text': '#C5BDC9',
-  '--user-bg': '#CD5B851F',
-  '--drop-overlay-bg': '#141313E8',
-  '--attach-bg': '#FFFFFF0D',
-  '--overlay-subtle': '#FFFFFF06',
-  '--overlay-light': '#FFFFFF0D',
-  '--overlay-medium': '#FFFFFF17',
-  '--overlay-strong': '#B896C133',
-  '--tab-slider-bg': '#B896C125',
-  '--term-bg': '#191719',
-  '--term-fg': '#E5DFE7',
-  '--term-cursor': '#DA84A4',
-  '--term-cursor-accent': '#141313',
-  '--term-selection-bg': '#CD5B8540',
-  '--term-ansi-black': '#353039',
-  '--term-ansi-red': '#E78FA4',
-  '--term-ansi-green': '#9DCCAC',
-  '--term-ansi-yellow': '#DBC295',
-  '--term-ansi-blue': '#A6B9E2',
-  '--term-ansi-magenta': '#C1A0D4',
-  '--term-ansi-cyan': '#9CCAD0',
-  '--term-ansi-white': '#D0CAD1',
-  '--term-ansi-bright-black': '#AAA2AD',
-  '--term-ansi-bright-red': '#F7B0C0',
-  '--term-ansi-bright-green': '#BAE2C8',
-  '--term-ansi-bright-yellow': '#EED9B2',
-  '--term-ansi-bright-blue': '#C2D0F2',
-  '--term-ansi-bright-magenta': '#DAC0EA',
-  '--term-ansi-bright-cyan': '#BCE4E9',
-  '--term-ansi-bright-white': '#F5F0F6',
-  '--radius-input': '18px',
-  '--radius-card': '18px',
-  '--radius-chat-card': '16px',
-  '--radius-chat-surface': '20px',
-  '--font-ui': 'Segoe UI, Microsoft YaHei UI, Microsoft YaHei, sans-serif',
-  '--font-serif': 'Noto Serif SC, Source Han Serif SC, serif',
-  '--font-mono': 'Cascadia Code, Consolas, monospace',
-};
-
-/* ── 颜色工具 ── */
-const hex2rgb = (h) => {
-  const m = /^#([0-9a-f]{6})$/i.exec(h || '');
-  return m ? [0, 2, 4].map((i) => parseInt(m[1].slice(i, i + 2), 16)) : [20, 19, 19];
-};
-const rgbStr = (h) => hex2rgb(h).join(', ');
-const toHex = (rgb) => '#' + rgb.map((v) => Math.max(0, Math.min(255, Math.round(v))).toString(16).padStart(2, '0')).join('');
-const shade = (h, amt) => toHex(hex2rgb(h).map((v) => v + (amt > 0 ? (255 - v) * amt : v * amt)));
-const luminance = (h) => {
-  const [r, g, b] = hex2rgb(h).map((v) => v / 255);
-  return 0.2126 * r + 0.7152 * g + 0.0722 * b;
-};
-
-/* ── 派生：方向跟着底色明暗翻 ── */
-function deriveColors({ bg, card, accent, text }) {
-  const isLight = luminance(bg) > 0.5;
-  const out = { ...BASE_COLORS };
-
-  out['--bg'] = bg;
-  out['--sidebar-bg'] = bg;
-  out['--term-bg'] = bg;
-  out['--drop-overlay-bg'] = bg.toUpperCase() + 'E8';
-  out['--bg-card'] = card;
-  out['--bg-glass'] = card.toUpperCase() + (isLight ? 'F2' : 'EB');
-
-  out['--accent'] = accent;
-  // 亮色下强调色要往深压，否则在白底上看不清
-  out['--accent-hover'] = isLight ? shade(accent, -0.15) : shade(accent, 0.18);
-  out['--accent-light'] = accent.toUpperCase() + (isLight ? '1A' : '26');
-  out['--link'] = isLight ? shade(accent, -0.12) : shade(accent, 0.28);
-  out['--link-hover'] = isLight ? shade(accent, -0.24) : shade(accent, 0.42);
-  out['--user-bg'] = accent.toUpperCase() + (isLight ? '14' : '1F');
-  out['--tab-slider-bg'] = accent.toUpperCase() + (isLight ? '1A' : '25');
-  out['--term-cursor'] = out['--accent-hover'];
-  out['--term-selection-bg'] = accent.toUpperCase() + (isLight ? '30' : '40');
-
-  out['--text'] = text;
-  out['--hana-text'] = text;
-  // 亮色下「次要文字」应该更浅（靠近背景），不是更深
-  out['--text-light'] = isLight ? shade(text, 0.28) : shade(text, -0.12);
-  out['--text-muted'] = isLight ? shade(text, 0.46) : shade(text, -0.32);
-  out['--term-fg'] = isLight ? shade(text, 0.12) : shade(text, -0.08);
-  out['--term-cursor-accent'] = isLight ? card : bg;
-  out['--term-ansi-white'] = out['--text-light'];
-  out['--term-ansi-bright-black'] = out['--text-muted'];
-
-  // 结构性透明层：亮色用黑色低透明度，暗色用白色
-  out['--border'] = isLight ? 'rgba(0,0,0,0.12)' : '#B896C138';
-  out['--overlay-subtle'] = isLight ? '#00000004' : '#FFFFFF06';
-  out['--overlay-light'] = isLight ? '#00000008' : '#FFFFFF0D';
-  out['--overlay-medium'] = isLight ? '#00000010' : '#FFFFFF17';
-  out['--overlay-strong'] = isLight ? '#00000018' : '#B896C133';
-  out['--shadow'] = isLight ? '#0000001F' : '#00000070';
-  out['--attach-bg'] = isLight ? '#00000006' : '#FFFFFF0D';
-  out['--jian-note-bg'] = isLight ? '#F1EDE8' : '#262127';
-  out['--jian-note-border'] = isLight ? 'rgba(0,0,0,0.10)' : '#B896C140';
-  out['--tool-bg'] = isLight ? '#00000005' : '#B896C10D';
-  out['--mood-bg'] = isLight ? '#00000006' : '#B896C112';
-  out['--mood-border'] = isLight ? 'rgba(0,0,0,0.10)' : '#B896C133';
-
-  return out;
-}
-
-/* ── 预设：一键填一套四个关键色 ── */
-const PRESETS = {
-  dark:  { bg: '#141313', card: '#1E1D1E', accent: '#CD5B85', text: '#F0EFF0' },
-  light: { bg: '#F6F7FB', card: '#FFFFFF', accent: '#3B6FD4', text: '#1C2026' },
-  paper: { bg: '#F8F4ED', card: '#FFFFFF', accent: '#A8763E', text: '#2A2622' },
-  ink:   { bg: '#0F1418', card: '#161C21', accent: '#4FA3C7', text: '#E6EDF3' },
-  blush: { bg: '#FBF2F4', card: '#FFFFFF', accent: '#C2567A', text: '#2E2228' },
-};
+/* 颜色基座 / 工具 / 派生 / 预设 已迁到 skinpack.mjs（纯函数，可单测）；此处改为 import 复用。
+   下方只保留 DOM 相关的 shrinkImage / 预览 / 渲染。 */
 
 /* ── 图片压缩：统一成 1920px 宽的 JPEG ── */
 async function shrinkImage(file, maxW = 1920, quality = 0.85) {
@@ -651,8 +554,14 @@ async function shrinkImage(file, maxW = 1920, quality = 0.85) {
 
 /* ── 工作台状态 ── */
 const comp = {
-  bg: null,        // { data, w, h, bytes }
+  bg: null,        // 暗套背景 { data, w, h, bytes, mime, motion, poster }
+  bgLight: null,   // 亮套背景（同上）
   shot: null,      // data URI，封面
+  dual: false,     // 是否双套（暗 + 亮）
+  linked: true,    // 双套联动：改一栏自动派生另一栏
+  linkMode: 'same-hue', // same-hue | inverse | complement
+  rimTouched: false,    // 用户手动调过 rim 否（未调则亮套用默认 0.12）
+  editingIsDual: false, // 正在编辑的是否 v3 双套包
 };
 
 const cn = {
@@ -688,7 +597,245 @@ const cn = {
   status: document.getElementById('c-status'),
   cancel: document.getElementById('c-cancel'),
   save: document.getElementById('c-save'),
+  // ── 双套 / 亮色套 ──
+  dual: document.getElementById('c-dual'),
+  linked: document.getElementById('c-linked'),
+  linkWrap: document.getElementById('c-link-wrap'),
+  linkMode: document.getElementById('c-linkmode'),
+  adaptive: document.getElementById('c-adaptive'),
+  lightWrap: document.getElementById('c-light-wrap'),
+  bgBoxL: document.getElementById('c-bg-box-l'),
+  bgInputL: document.getElementById('c-bg-l'),
+  bgPreviewL: document.getElementById('c-bg-preview-l'),
+  bgClearL: document.getElementById('c-bg-clear-l'),
+  alphaL: document.getElementById('c-alpha-l'),
+  alphaValL: document.getElementById('c-alpha-l-val'),
+  posL: document.getElementById('c-pos-l'),
+  bgColorL: document.getElementById('c-bg-color-l'),
+  cardL: document.getElementById('c-card-l'),
+  accentL: document.getElementById('c-accent-l'),
+  textL: document.getElementById('c-text-l'),
 };
+
+/* ════════════════════════════════════════════════════════════════
+   v3 工作台线：双套（暗+亮）编辑 / 动图上传与预览 / 预算门禁
+   ════════════════════════════════════════════════════════════════ */
+
+function readFileAsDataURL(file) {
+  return new Promise((resolve, reject) => {
+    const r = new FileReader();
+    r.onload = () => resolve(r.result);
+    r.onerror = () => reject(r.error || new Error('读取失败'));
+    r.readAsDataURL(file);
+  });
+}
+
+async function firstFramePoster(file) {
+  const bmp = await createImageBitmap(file);
+  const maxW = 1920;
+  const scale = Math.min(1, maxW / bmp.width);
+  const w = Math.max(1, Math.round(bmp.width * scale));
+  const h = Math.max(1, Math.round(bmp.height * scale));
+  const cv = document.createElement('canvas');
+  cv.width = w; cv.height = h;
+  const ctx = cv.getContext('2d');
+  ctx.drawImage(bmp, 0, 0, w, h);
+  if (bmp.close) bmp.close();
+  return cv.toDataURL('image/jpeg', 0.85);
+}
+
+/** 上传背景：动图保持原格式（不重编码，否则丢动画）；静态走 shrinkImage → JPEG。 */
+async function loadBackground(file, which) {
+  const isLightCol = which === 'light';
+  const statusPrefix = isLightCol ? '亮色套 ' : '';
+  const name = (file.name || '').toLowerCase();
+  const dot = name.lastIndexOf('.');
+  const ext = dot >= 0 ? name.slice(dot) : '';
+  const mime = file.type || '';
+  const isVideo = VIDEO_EXT.has(ext) || /^video\//.test(mime);
+  if (isVideo) {
+    cn.status.textContent = statusPrefix + '开任务…';
+    try {
+      const buf = await file.arrayBuffer();
+      const r0 = await api('POST', '/wallpaper/from-video?size=' + buf.byteLength
+        + '&dur=10&width=800&fps=10&quality=42&dissolve=8');
+      if (!r0 || !r0.ok || !r0.jobId) {
+        setStatus(statusPrefix + '视频转换失败：' + ((r0 && r0.error) || '未知错误'));
+        return;
+      }
+      // 分块传输：宿主代理对大 body 会挂起（0.7.6 实测 20MB 整块卡死），2MB 一块走
+      const CHUNK = 2 * 1024 * 1024;
+      const total = Math.max(1, Math.ceil(buf.byteLength / CHUNK));
+      for (let i = 0; i < total; i++) {
+        const off = i * CHUNK;
+        const piece = buf.slice(off, Math.min(buf.byteLength, off + CHUNK));
+        await api('POST', '/wallpaper/chunk?id=' + encodeURIComponent(r0.jobId) + '&offset=' + off, piece);
+        cn.status.textContent = statusPrefix + '传输视频 ' + Math.round(((i + 1) / total) * 100) + '%…';
+      }
+      await api('POST', '/wallpaper/finalize?id=' + encodeURIComponent(r0.jobId));
+      // 任务制：每 0.9s 轮询进度，阶段由后端报（抽帧/编码/降档），前端补已等秒数
+      const t0 = Date.now();
+      let r = null;
+      for (;;) {
+        if (Date.now() - t0 > 6 * 60 * 1000) throw new Error('超时（6 分钟无结果）');
+        await new Promise((res) => setTimeout(res, 900));
+        r = await api('GET', '/wallpaper/job?id=' + encodeURIComponent(r0.jobId));
+        if (!r || !r.ok) throw new Error((r && r.error) || '进度查询失败');
+        const sec = Math.round((Date.now() - t0) / 1000);
+        cn.status.textContent = statusPrefix + (r.message || r.stage) + '（已等 ' + sec + 's）';
+        if (r.stage === 'done') break;
+        if (r.stage === 'error') throw new Error(r.error || '转换失败');
+      }
+      const res = r.result;
+      const obj = {
+        data: res.asset, mime: 'image/webp', w: res.width, h: res.height,
+        bytes: Math.round(res.uriBytes * 0.75), motion: 'animated-image', poster: res.poster || null,
+      };
+      if (isLightCol) comp.bgLight = obj; else comp.bg = obj;
+      renderBgPreview(isLightCol);
+      setStatus(statusPrefix + '视频已转动态壁纸：' + res.width + '×' + res.height + ' · '
+        + res.frames + ' 帧 · URI ' + fmtMB(res.uriBytes) + ' · 用时 ' + Math.round((Date.now() - t0) / 1000) + 's');
+    } catch (e) {
+      setStatus(statusPrefix + '视频转换失败：' + e.message);
+    }
+    return;
+  }
+  const isAnimated = ANIMATED_EXT.has(ext) || mime === 'image/webp' || mime === 'image/gif' || mime === 'image/apng';
+  cn.status.textContent = statusPrefix + '处理中…';
+  try {
+    if (isAnimated) {
+      const dataUri = await readFileAsDataURL(file);
+      let w = 0, h = 0;
+      try { const bmp = await createImageBitmap(file); w = bmp.width; h = bmp.height; if (bmp.close) bmp.close(); } catch (_) {}
+      const chk = checkImageFile({ bytes: file.size, width: w, height: h });
+      if (!chk.ok) {
+        setStatus(statusPrefix + '动图被拒：' + chk.errors.join('；') + '（实际 ' + fmtMB(chk.actualBytes || file.size) + ' / ' + (w || '?') + '×' + (h || '?') + '）');
+        return;
+      }
+      let poster = null;
+      try { poster = await firstFramePoster(file); } catch (_) {}
+      const obj = { data: dataUri, mime: mime || 'image/webp', w, h, bytes: file.size, motion: 'animated-image', poster };
+      if (isLightCol) comp.bgLight = obj; else comp.bg = obj;
+      renderBgPreview(isLightCol);
+      setStatus(statusPrefix + '已载入动图 ' + w + '×' + h + ' · ' + fmtMB(file.size) + '（预览会动' + (poster ? '，已生成静态 poster' : '，poster 留空') + '）');
+    } else {
+      const shr = await shrinkImage(file);
+      const obj = { data: shr.data, mime: 'image/jpeg', w: shr.w, h: shr.h, bytes: shr.bytes, motion: 'none', poster: null };
+      if (isLightCol) comp.bgLight = obj; else comp.bg = obj;
+      renderBgPreview(isLightCol);
+      setStatus(statusPrefix + '已载入 ' + shr.w + '×' + shr.h + ' · 约 ' + Math.round(shr.bytes / 1024) + ' KB');
+    }
+  } catch (e) {
+    setStatus(statusPrefix + '读图失败：' + e.message);
+  }
+}
+
+/** 背景预览：动图用 <img src=dataURI>（真会动），静态用 CSS 背景（验收 7）。 */
+function renderBgPreview(isLightCol) {
+  const obj = isLightCol ? comp.bgLight : comp.bg;
+  const previewEl = isLightCol ? cn.bgPreviewL : cn.bgPreview;
+  const alphaEl = isLightCol ? cn.alphaL : cn.alpha;
+  const posEl = isLightCol ? cn.posL : cn.pos;
+  const colorEl = isLightCol ? cn.bgColorL : cn.bgColor;
+  const emptyHtml = isLightCol
+    ? '<span>亮色套背景图<br><small>支持动图 webp/gif/apng（≤5MB）</small></span>'
+    : '<span>点击选一张背景图<br><small>会自动压缩到 1920px 宽</small></span>';
+  if (!obj || !obj.data) {
+    if (previewEl) { previewEl.style.backgroundImage = ''; previewEl.innerHTML = emptyHtml; }
+    return;
+  }
+  const alpha = Number(alphaEl ? alphaEl.value : 0.6);
+  const color = colorEl ? colorEl.value : '#141313';
+  const pos = posEl ? posEl.value : '50% 50%';
+  const desc = buildBgPreviewDescriptor({ data: obj.data, motion: obj.motion, alpha, color, pos });
+  if (previewEl) {
+    if (desc.tag === 'img') {
+      previewEl.style.backgroundImage = '';
+      previewEl.innerHTML = '';
+      const img = document.createElement('img');
+      img.src = desc.src; img.className = 'anim-img'; img.alt = 'animated background preview';
+      previewEl.appendChild(img);
+    } else {
+      previewEl.innerHTML = '';
+      previewEl.style.backgroundImage = desc.style.backgroundImage;
+      previewEl.style.backgroundSize = desc.style.backgroundSize;
+      previewEl.style.backgroundPosition = desc.style.backgroundPosition;
+    }
+  }
+}
+
+function showLight() {
+  if (cn.lightWrap) cn.lightWrap.hidden = false;
+  if (cn.linkWrap) cn.linkWrap.hidden = false;
+}
+function hideLight() {
+  if (cn.lightWrap) cn.lightWrap.hidden = true;
+  if (cn.linkWrap) cn.linkWrap.hidden = true;
+}
+
+/** 联动：改一栏，按 mode 自动派生另一栏（规格 §4.1）。 */
+function applyLinkage(source) {
+  if (!comp.dual || !comp.linked) return;
+  const mode = comp.linkMode;
+  if (source === 'dark') {
+    const d = { bg: cn.bgColor.value, card: cn.card.value, accent: cn.accent.value, text: cn.text.value };
+    const l = deriveKeyColors(d, 'dark', mode);
+    if (cn.bgColorL) cn.bgColorL.value = l.bg;
+    if (cn.cardL) cn.cardL.value = l.card;
+    if (cn.accentL) cn.accentL.value = l.accent;
+    if (cn.textL) cn.textL.value = l.text;
+  } else {
+    const l = { bg: cn.bgColorL.value, card: cn.cardL.value, accent: cn.accentL.value, text: cn.textL.value };
+    const d = deriveKeyColors(l, 'light', mode);
+    cn.bgColor.value = d.bg;
+    cn.card.value = d.card;
+    cn.accent.value = d.accent;
+    cn.text.value = d.text;
+  }
+  renderBgPreview(false);
+  renderBgPreview(true);
+}
+
+/* ── 双套开关 / 联动 / 亮色套控件 接线 ── */
+if (cn.dual) {
+  cn.dual.addEventListener('change', () => {
+    comp.dual = cn.dual.checked;
+    if (comp.dual) {
+      showLight();
+      comp.linked = !!(cn.linked && cn.linked.checked);
+      applyLinkage('dark');
+      cn.status.textContent = '已开启双套：暗/亮各一套，可分别编辑或用联动自动派生';
+    } else {
+      hideLight();
+      comp.editingIsDual = false;
+      cn.status.textContent = '已切回单套（暗色），导出为 v2 单包';
+    }
+  });
+}
+if (cn.linked) {
+  cn.linked.addEventListener('change', () => { comp.linked = cn.linked.checked; if (comp.linked) applyLinkage('dark'); });
+}
+if (cn.linkMode) {
+  cn.linkMode.addEventListener('change', () => { comp.linkMode = cn.linkMode.value; if (comp.linked) applyLinkage('dark'); });
+}
+['bgColor', 'card', 'accent', 'text'].forEach((k) => { if (cn[k]) cn[k].addEventListener('input', () => applyLinkage('dark')); });
+['bgColorL', 'cardL', 'accentL', 'textL'].forEach((k) => { if (cn[k]) cn[k].addEventListener('input', () => applyLinkage('light')); });
+if (cn.bgInputL) cn.bgInputL.addEventListener('change', async () => {
+  const f = cn.bgInputL.files && cn.bgInputL.files[0];
+  cn.bgInputL.value = '';
+  if (f) await loadBackground(f, 'light');
+});
+if (cn.bgClearL) cn.bgClearL.addEventListener('click', () => {
+  comp.bgLight = null;
+  renderBgPreview(true);
+  cn.status.textContent = '已清除亮色套背景';
+});
+if (cn.alphaL) cn.alphaL.addEventListener('input', () => {
+  if (cn.alphaValL) cn.alphaValL.textContent = Number(cn.alphaL.value).toFixed(2);
+  renderBgPreview(true);
+});
+if (cn.posL) cn.posL.addEventListener('change', () => renderBgPreview(true));
+if (cn.bgColorL) cn.bgColorL.addEventListener('input', () => renderBgPreview(true));
 
 /* ── 内置背景 ── */
 /* ── 预设 ── */
@@ -705,6 +852,7 @@ document.querySelectorAll('[data-preset]').forEach((btn) => {
     document.querySelectorAll('[data-preset]').forEach((b) => b.classList.toggle('is-on', b === btn));
     if (comp.bg) applyBgPreview();
     cn.status.textContent = '已套用预设：' + btn.textContent + '（可直接改单个颜色微调）';
+    applyLinkage('dark');
   });
 });
 
@@ -727,7 +875,12 @@ async function editSkin(s) {
     cn.tags.value = (pack.tags || []).join(', ');
     cn.group.value = pack.group || '';
 
-    const c = pack.theme.colors || {};
+    const theme = pack.theme;
+    const variants = Array.isArray(theme.variants) ? theme.variants : null;
+    const darkV = variants ? (variants.find((v) => v.appearance === 'dark') || variants[0]) : theme;
+    const lightV = variants ? (variants.find((v) => v.appearance === 'light') || variants[1] || darkV) : null;
+
+    const c = darkV.colors || {};
     cn.bgColor.value = toHex(hex2rgb(c['--bg'] || '#141313'));
     cn.card.value = toHex(hex2rgb(c['--bg-card'] || '#1E1D1E'));
     cn.accent.value = toHex(hex2rgb(c['--accent'] || '#CD5B85'));
@@ -736,16 +889,17 @@ async function editSkin(s) {
     const radiusNum = parseInt(String(c['--radius-card'] || '18').replace(/[^\d]/g, ''), 10);
     cn.radius.value = Number.isFinite(radiusNum) ? Math.max(0, Math.min(28, radiusNum)) : 18;
     cn.radiusVal.textContent = cn.radius.value;
-    const rim = pack.theme.material && typeof pack.theme.material.rim === 'number' ? pack.theme.material.rim : 0.26;
+    const rim = darkV.material && typeof darkV.material.rim === 'number' ? darkV.material.rim : 0.26;
     cn.rim.value = Math.max(0, Math.min(0.8, rim));
     cn.rimVal.textContent = Number(cn.rim.value).toFixed(2);
-    const blur = pack.theme.material && typeof pack.theme.material.blur === 'number' ? pack.theme.material.blur : 26;
+    comp.rimTouched = false;
+    const blur = darkV.material && typeof darkV.material.blur === 'number' ? darkV.material.blur : 26;
     cn.blur.value = Math.max(0, Math.min(60, blur));
     cn.blurVal.textContent = cn.blur.value;
     readFontsFrom(c);
     readAnsiFrom(c);
 
-    comp.shot = (pack.theme && pack.theme.shot) || pack.shot || null;
+    comp.shot = (theme && theme.shot) || pack.shot || null;
     if (comp.shot) {
       cn.shotPreview.innerHTML = '';
       const img = document.createElement('img');
@@ -756,22 +910,60 @@ async function editSkin(s) {
       cn.shotPreview.hidden = true;
     }
 
-    const bgl = pack.theme.background;
+    // 双套开关状态
+    comp.dual = !!variants && variants.length > 0;
+    comp.editingIsDual = comp.dual;
+    if (cn.dual) cn.dual.checked = comp.dual;
+    if (comp.dual) showLight(); else hideLight();
+
+    // 暗套背景
+    const bgl = darkV.background;
     if (bgl && bgl.asset) {
-      comp.bg = { data: bgl.asset, w: 0, h: 0, bytes: Math.round(bgl.asset.length * 0.75) };
+      comp.bg = {
+        data: bgl.asset, w: 0, h: 0, bytes: Math.round(bgl.asset.length * 0.75),
+        mime: (bgl.motion && bgl.motion.mode === 'animated-image') ? 'image/webp' : 'image/jpeg',
+        motion: (bgl.motion && bgl.motion.mode === 'animated-image') ? 'animated-image' : 'none',
+        poster: bgl.poster || null,
+      };
       cn.alpha.value = typeof bgl.panelAlpha === 'number' ? bgl.panelAlpha : 0.6;
       cn.alphaVal.textContent = Number(cn.alpha.value).toFixed(2);
       cn.pos.value = bgl.position || '50% 50%';
-      applyBgPreview();
+      renderBgPreview(false);
     } else {
       comp.bg = null;
-      cn.bgPreview.style.backgroundImage = '';
-      cn.bgPreview.innerHTML = '<span>点击选一张背景图<br><small>会自动压缩到 1920px 宽</small></span>';
+      renderBgPreview(false);
+    }
+
+    // 亮色套列
+    if (lightV && lightV !== darkV) {
+      const lc = lightV.colors || {};
+      cn.bgColorL.value = toHex(hex2rgb(lc['--bg'] || '#F6F7FB'));
+      cn.cardL.value = toHex(hex2rgb(lc['--bg-card'] || '#FFFFFF'));
+      cn.accentL.value = toHex(hex2rgb(lc['--accent'] || '#3B6FD4'));
+      cn.textL.value = toHex(hex2rgb(lc['--text'] || '#1C2026'));
+      const lbg = lightV.background;
+      if (lbg && lbg.asset) {
+        comp.bgLight = {
+          data: lbg.asset, w: 0, h: 0, bytes: Math.round(lbg.asset.length * 0.75),
+          mime: (lbg.motion && lbg.motion.mode === 'animated-image') ? 'image/webp' : 'image/jpeg',
+          motion: (lbg.motion && lbg.motion.mode === 'animated-image') ? 'animated-image' : 'none',
+          poster: lbg.poster || null,
+        };
+        cn.alphaL.value = typeof lbg.panelAlpha === 'number' ? lbg.panelAlpha : 0.6;
+        if (cn.alphaValL) cn.alphaValL.textContent = Number(cn.alphaL.value).toFixed(2);
+        cn.posL.value = lbg.position || '50% 50%';
+        renderBgPreview(true);
+      } else {
+        comp.bgLight = null;
+        renderBgPreview(true);
+      }
+    } else {
+      comp.bgLight = null;
     }
 
     cn.save.textContent = '保存修改';
     cn.status.textContent = '正在编辑：' + ((pack.names && pack.names.zh) || pack.packId) +
-      (bgl && bgl.asset ? ' · 已有背景图' : ' · 纯色');
+      (comp.dual ? ' · 双套（暗+亮）' : (bgl && bgl.asset ? ' · 已有背景图' : ' · 纯色'));
   } catch (e) {
     cn.status.textContent = '读取失败：' + e.message;
     closeComposer();
@@ -792,8 +984,19 @@ function resetComposer() {
   cn.rim.value = 0.26; cn.rimVal.textContent = '0.26';
   cn.blur.value = 26; cn.blurVal.textContent = '26';
   comp.bg = null;
-  cn.bgPreview.style.backgroundImage = '';
-  cn.bgPreview.innerHTML = '<span>点击选一张背景图<br><small>会自动压缩到 1920px 宽</small></span>';
+  comp.bgLight = null;
+  comp.dual = false;
+  comp.linked = true;
+  comp.linkMode = 'same-hue';
+  comp.rimTouched = false;
+  comp.editingIsDual = false;
+  if (cn.dual) cn.dual.checked = false;
+  if (cn.linked) cn.linked.checked = true;
+  if (cn.linkMode) cn.linkMode.value = 'same-hue';
+  if (cn.adaptive) cn.adaptive.value = 'manual';
+  hideLight();
+  renderBgPreview(false);
+  renderBgPreview(true);
   document.querySelectorAll('[data-preset]').forEach((b) => b.classList.remove('is-on'));
   cn.status.textContent = '';
 }
@@ -991,42 +1194,23 @@ cn.alpha.addEventListener('input', () => {
   if (comp.bg) applyBgPreview();
 });
 
-function applyBgPreview() {
-  const a = Number(cn.alpha.value);
-  const [r, g, b] = hex2rgb(cn.bgColor.value);
-  cn.bgPreview.style.backgroundImage =
-    `linear-gradient(rgba(${r},${g},${b},${a}), rgba(${r},${g},${b},${a})), url("${comp.bg.data}")`;
-  cn.bgPreview.style.backgroundSize = 'cover';
-  cn.bgPreview.style.backgroundPosition = cn.pos.value;
-  cn.bgPreview.innerHTML = '';
-}
+function applyBgPreview() { renderBgPreview(false); }
 
 cn.bgInput.addEventListener('change', async () => {
   const f = cn.bgInput.files && cn.bgInput.files[0];
   cn.bgInput.value = '';
-  if (!f) return;
-  cn.status.textContent = '压缩中…';
-  try {
-    comp.bg = await shrinkImage(f);
-    applyBgPreview();
-    cn.status.textContent =
-      `已载入 ${comp.bg.w}×${comp.bg.h} · 约 ${Math.round(comp.bg.bytes / 1024)} KB`;
-  } catch (e) {
-    cn.status.textContent = '读图失败：' + e.message;
-    comp.bg = null;
-  }
+  if (f) await loadBackground(f, 'dark');
 });
 
 cn.bgClear.addEventListener('click', () => {
   comp.bg = null;
-  cn.bgPreview.style.backgroundImage = '';
-  cn.bgPreview.innerHTML = '<span>点击选一张背景图<br><small>会自动压缩到 1920px 宽</small></span>';
+  renderBgPreview(false);
   cn.status.textContent = '已清除背景图（将生成纯色皮肤）';
 });
 
 cn.bgColor.addEventListener('input', () => { if (comp.bg) applyBgPreview(); });
 cn.radius.addEventListener('input', () => { cn.radiusVal.textContent = cn.radius.value; });
-cn.rim.addEventListener('input', () => { cn.rimVal.textContent = Number(cn.rim.value).toFixed(2); });
+cn.rim.addEventListener('input', () => { cn.rimVal.textContent = Number(cn.rim.value).toFixed(2); comp.rimTouched = true; });
 cn.blur.addEventListener('input', () => { cn.blurVal.textContent = cn.blur.value; });
 
 cn.shot.addEventListener('click', async () => {
@@ -1090,7 +1274,7 @@ cn.save.addEventListener('click', async () => {
   writeAnsiInto(colors);
 
   const alpha = Number(cn.alpha.value);
-  const theme = {
+  let theme = {
     key: 'default',
     appearance: isLight ? 'light' : 'dark',
     colors,
@@ -1115,9 +1299,21 @@ cn.save.addEventListener('click', async () => {
     };
   }
 
+  let packSchema = 'hana-skinpack/2';
+  if (comp.dual) {
+    const darkKeys = { bg: cn.bgColor.value, card: cn.card.value, accent: cn.accent.value, text: cn.text.value };
+    const lightKeys = { bg: cn.bgColorL.value, card: cn.cardL.value, accent: cn.accentL.value, text: cn.textL.value };
+    const radius = Number(cn.radius.value);
+    const rim = comp.rimTouched ? Number(cn.rim.value) : undefined;
+    const blur = Number(cn.blur.value);
+    const vDark = buildVariant({ ...darkKeys, appearance: 'dark', bgImage: comp.bg, alpha: Number(cn.alpha.value), pos: cn.pos.value, radius, rim, blur });
+    const vLight = buildVariant({ ...lightKeys, appearance: 'light', bgImage: comp.bgLight, alpha: Number(cn.alphaL.value), pos: cn.posL.value, radius, rim, blur });
+    theme = { key: 'default', adaptive: { mode: (cn.adaptive && cn.adaptive.value) || 'manual' }, variants: [vDark, vLight] };
+    packSchema = SCHEMA_V3;
+  }
   const prev = state.skins.find((x) => x.packId === packId);
   const pack = {
-    schema: 'hana-skinpack/2',
+    schema: packSchema,
     packId,
     packVersion: '1.0.0',
     names: { zh: name },
@@ -1131,6 +1327,14 @@ cn.save.addEventListener('click', async () => {
   };
   // 封面统一存 theme.shot（后端两处都认，但只有一个真源）
   if (comp.shot) theme.shot = comp.shot;
+
+  // 单包体积门禁（规格 §2.3）：越过 12MB 直接拒绝并报告实际数字
+  const budget = checkPackBudget(pack);
+  if (!budget.ok) {
+    cn.save.disabled = false;
+    cn.status.textContent = '导出被拒：' + budget.errors[0] + `（实际 ${fmtMB(budget.bytes)}）`;
+    return;
+  }
 
   cn.save.disabled = true;
   cn.status.textContent = '入库中…';
