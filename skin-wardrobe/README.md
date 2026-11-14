@@ -40,3 +40,25 @@ Build changed sources, then explicitly reload through Builder or App Manager. Lo
 The starter tool uses the declared name, without an automatic host prefix. The manifest requests `app/tools.expose-to-model`; after approval, enable the App for the intended Agent. Discover the current tool schema before calling it. The Agent's tool discovery mode determines whether the tool is listed directly or found through deferred discovery.
 
 The full contract is in `APPS.md` / `APPS_EN.md`.
+
+## 跨 App 通道与导出接口（自有契约）
+
+### 应用主题：`app:skin-wardrobe/apply-theme`（总线服务）
+
+- 调用：`sdk.bus.requestService('app:skin-wardrobe/apply-theme', { themeId })`
+- 前提：本 App 持 `app/services.provide`；调用方 App 需持 `app/services.call`（各自 manifest 声明，宿主默认拒）
+- payload `{ themeId }` 必须是宿主注册表里已注册的主题 id（双套带 `-dark`/`-light` 后缀；内置如 `warm-paper`）
+- 行为：校验已注册 → 备份 `user/preferences.json` → 写 `appearance.theme` → 立即执行（不进待办队列、不碰注册表）
+- 返回 `{ ok, themeId, caller, effectiveAfterRestart: true }`；`caller` 是宿主盖章的调用方 appId，不可伪造，会记入衣橱日志
+- **重启 Hana 后生效**（渲染器启动时读偏好）
+- 运行时当前主题读取：宿主根元素 `data-theme` 属性（`documentElement.getAttribute('data-theme')`），与 agent 工具 `wardrobe_apply_theme` 同链路
+
+### 主题配置导出：`GET /tokens`（HTTP 路由）
+
+- `?packId=` 按包查；`?themeId=` 按 `data-theme` 的值反查（内置主题返回 `resolved: null`）
+- 返回原始配置值（`source: "pack-config"`），非运行时快照；字段只增不改语义，破坏性变更升 `version`
+
+### 边界（设计如此）
+
+- 通道只能切换**已注册**主题；注册/撤销仍走待办队列 → 执行器（备份 + 幂等 + 三处注册表），总线服务绕不过这一层
+- App 无法直写宿主偏好文件；唯一写入路径是本执行器，全部动作有备份可回滚

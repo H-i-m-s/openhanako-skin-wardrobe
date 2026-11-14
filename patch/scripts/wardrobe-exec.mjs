@@ -52,6 +52,49 @@ const APPLY = process.argv.includes('--apply');
 const target = JSON.parse(readFileSync(join(HANA, 'artifacts', 'desktop-target.json'), 'utf8')).current;
 const THEMES_DIR = join(target.renderer.versionDir, 'themes');
 
+/* ── 直接应用模式：node wardrobe-exec.mjs apply --theme <id> ──
+   跨 App 通道（app:skin-wardrobe/apply-theme）与 agent 工具共用。
+   只切换宿主偏好的 appearance.theme，不碰注册表、不碰待办。
+   前提：主题必须在宿主注册表里（内置或已由执行器启用）。
+   生效时机：重启 Hana（渲染器启动时读偏好）。 */
+if (process.argv[2] === 'apply') {
+  const themeId = String(process.argv[4] || '');
+  if (process.argv[3] !== '--theme' || !/^[A-Za-z0-9_.-]+$/.test(themeId)) {
+    console.error('用法: wardrobe-exec.mjs apply --theme <已注册的主题id>');
+    process.exit(2);
+  }
+  const listed = registryOps(['list']).split(/\r?\n/).flatMap((l) => l.split(/,\s*/)).map((s) => s.trim());
+  if (!listed.includes(themeId)) {
+    console.error('未注册：' + themeId + '（先用启用待办把主题写进宿主，再应用）');
+    process.exit(3);
+  }
+  const prefsPath = join(HANA, 'user', 'preferences.json');
+  if (!existsSync(prefsPath)) {
+    console.error('宿主偏好文件不存在：' + prefsPath);
+    process.exit(3);
+  }
+  const raw = readFileSync(prefsPath, 'utf8');
+  let prefs;
+  try { prefs = JSON.parse(raw); } catch (e) {
+    console.error('偏好文件解析失败：' + e.message);
+    process.exit(3);
+  }
+  const prev = (prefs.appearance && prefs.appearance.theme) || null;
+  if (prev === themeId) {
+    console.log('apply:已是当前主题 ' + themeId + '（无变化）');
+    process.exit(0);
+  }
+  const bak = prefsPath + '.bak-' + new Date().toISOString().replace(/[:.]/g, '-');
+  copyFileSync(prefsPath, bak);
+  if (!prefs.appearance || typeof prefs.appearance !== 'object') prefs.appearance = {};
+  prefs.appearance.theme = themeId;
+  writeFileSync(prefsPath, JSON.stringify(prefs, null, 2) + '\n', 'utf8');
+  console.log('apply:' + prev + ' -> ' + themeId);
+  console.log('apply:备份 ' + basename(bak));
+  console.log('apply:重启 Hana 后生效');
+  process.exit(0);
+}
+
 /* ── 读待办 ── */
 function readPending() {
   if (!existsSync(PENDING)) return [];

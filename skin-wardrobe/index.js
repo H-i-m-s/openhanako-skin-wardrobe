@@ -82,6 +82,29 @@ export default defineApp(async (sdk) => {
     }
   }
 
+  /* ── 直接应用主题（跨 App 通道与 agent 工具共用）──
+     与 runExecutor 同一条 spawn 链（权限旗子一致），但不走待办队列、
+     不碰注册表，只改宿主偏好里的 appearance.theme。 */
+  async function runApplyTheme(themeId) {
+    const script = findExecutor();
+    if (!script) return { ok: false, output: '找不到衣橱执行器。' };
+    const perm = process.permission
+      ? ['--allow-fs-read=*', '--allow-fs-write=*', '--allow-child-process']
+      : [];
+    const node = await resolveNode();
+    try {
+      const out = execFileSync(node, [...perm, script, 'apply', '--theme', themeId], {
+        encoding: 'utf8',
+        maxBuffer: 32 * 1024 * 1024,
+        windowsHide: true,
+      });
+      return { ok: true, output: out };
+    } catch (e) {
+      const out = [e.stdout, e.stderr, e.message].filter(Boolean).join('\n').trim();
+      return { ok: false, output: out || '应用退出异常' };
+    }
+  }
+
   /* ── 预装内置主题（幂等：已入库则跳过）── */
   try {
     const APP_ROOT = dirname(fileURLToPath(import.meta.url));
@@ -305,6 +328,50 @@ export default defineApp(async (sdk) => {
     app.get('/tokens', (c) => {
       const hostIds = readHostThemeIds();
       const wanted = c.req.query('packId');
+      // ?themeId= 按宿主主题 id 反查包配置（data-theme 的值，如 hana-miku-dark）。
+      // 运行时当前主题本身请读宿主根元素 data-theme 属性；这里只负责 id -> 包配置的映射。
+      const wantTheme = c.req.query('themeId');
+      if (wantTheme) {
+        if (!/^[A-Za-z0-9_.-]+$/.test(wantTheme)) {
+          return c.json({ ok: false, error: 'themeId 含非法字符' }, 400);
+        }
+        const m = /^hana-([A-Za-z0-9_.-]+?)(-dark|-light)?$/.exec(wantTheme);
+        let resolved = null;
+        if (m) {
+          const variant = m[2] ? m[2].slice(1) : null;
+          for (const name of readdirSync(skinsDir)) {
+            const dir = join(skinsDir, name);
+            if (!statSync(dir).isDirectory()) continue;
+            const f = join(dir, 'skin.json');
+            if (!existsSync(f)) continue;
+            try {
+              const pack = JSON.parse(readFileSync(f, 'utf8'));
+              if (pack.packId !== m[1]) continue;
+              const t = packTokens(pack, hostIds);
+              const app = variant
+                ? (t.appearances.find((a) => a.appearance === variant) || null)
+                : (t.appearances[0] || null);
+              resolved = {
+                packId: t.skinId,
+                variant: app ? app.appearance : variant,
+                installed: t.installed,
+                appearance: app,
+                pack: t,
+              };
+              break;
+            } catch { /* 下一目录 */ }
+          }
+        }
+        return c.json({
+          ok: true,
+          version: 1,
+          source: 'pack-config',
+          themeId: wantTheme,
+          resolved,
+          note: '当前主题请读宿主根元素 data-theme；本接口按 themeId 反查衣橱包配置（原始配置值，非运行时快照）',
+          generatedAt: new Date().toISOString(),
+        });
+      }
       const packs = [];
       for (const name of readdirSync(skinsDir)) {
         const dir = join(skinsDir, name);
@@ -520,7 +587,10 @@ export default defineApp(async (sdk) => {
      - 只读、带版本号；source: "pack-config" = 写入主题 CSS 的原始配置值，非运行时快照
      - 颜色 / 字体 / 圆角为核心字段；背景只给元数据不带位图；材质可选
      - 稳定契约：字段只增不改语义；破坏性变更升 version
-     - 消费方式：GET /api/apps/skin-wardrobe/routes/tokens[?packId=xxx] */
+     - 消费方式：GET /api/apps/skin-wardrobe/routes/tokens[?packId=xxx]
+     - v1.1（2026-11-14）：新增 ?themeId= 反查（入参、响应字段均为增量）；
+       运行时「当前主题」不由本接口提供——宿主已把它写在根元素 data-theme 属性上，
+       同文档插件直接 documentElement.getAttribute('data-theme') 读取，再拿 id 来本接口查配置 */
   function packTokens(pack, hostIds) {
     const t = pack.theme || {};
     const variants = Array.isArray(t.variants) ? t.variants : null;
@@ -582,6 +652,27 @@ export default defineApp(async (sdk) => {
     };
   }
 
+  /* ── 跨 App 应用主题通道（app:skin-wardrobe/apply-theme）──
+     契约 v1（2026-11-14）：
+     - 调用：bus.requestService('app:skin-wardrobe/apply-theme', { themeId })
+       调用方 App 需持 app/services.call capability；本 App 持 app/services.provide（manifest 已声明）
+     - payload: { themeId: string }——宿主注册表里已注册的主题 id（双套带 -dark/-light 后缀，内置如 warm-paper）
+     - 返回: { ok, themeId, caller, effectiveAfterRestart, output? } / { ok:false, themeId, caller, error }
+     - 行为: 校验 id 已注册 → 备份 user/preferences.json → 写 appearance.theme → 立即执行（不进待办队列、不碰注册表）
+     - 生效时机: 重启 Hana；callerAppId 由宿主盖章（不可伪造）并记入衣橱日志
+     - 运行时当前主题读取: 宿主根元素 data-theme 属性（见 /tokens 契约注释） */
+  await sdk.bus.handle('apply-theme', async (payload, ctx) => {
+    const themeId = payload && typeof payload === 'object' ? String(payload.themeId || '') : '';
+    if (!/^[A-Za-z0-9_.-]+$/.test(themeId)) {
+      return { ok: false, error: 'themeId 非法（只允许字母数字 _ . -）' };
+    }
+    const r = await runApplyTheme(themeId);
+    try { sdk.logger.info('apply-theme: caller=' + (ctx && ctx.callerAppId) + ' theme=' + themeId + ' ok=' + r.ok); } catch { /* 日志不可用就算了 */ }
+    return r.ok
+      ? { ok: true, themeId, caller: ctx && ctx.callerAppId, effectiveAfterRestart: true, output: r.output.slice(-400) }
+      : { ok: false, themeId, caller: ctx && ctx.callerAppId, error: r.output.slice(-400) };
+  }, { allowCrossApp: true });
+
   /* ── 工具：给 agent 读待办 ── */
   await sdk.tools.register({
     name: 'wardrobe_pending',
@@ -594,6 +685,22 @@ export default defineApp(async (sdk) => {
       return {
         content: [{ type: 'text', text: '待办 ' + list.length + ' 条：\n' + lines.join('\n') }],
       };
+    },
+  });
+
+  await sdk.tools.register({
+    name: 'wardrobe_apply_theme',
+    description: '应用一个已注册的宿主主题（切换外观）。themeId 如 hana-miku-dark / warm-paper；双套包带 -dark/-light 后缀。重启 Hana 后生效。',
+    parameters: {
+      type: 'object',
+      properties: { themeId: { type: 'string', description: '已注册的主题 id' } },
+      required: ['themeId'],
+    },
+    execute: async (args) => {
+      const themeId = String((args && args.themeId) || '');
+      if (!/^[A-Za-z0-9_.-]+$/.test(themeId)) return { content: [{ type: 'text', text: 'themeId 非法（只允许字母数字 _ . -）' }] };
+      const r = await runApplyTheme(themeId);
+      return { content: [{ type: 'text', text: (r.ok ? '已应用 ' : '应用失败：') + themeId + '\n' + r.output }] };
     },
   });
 
